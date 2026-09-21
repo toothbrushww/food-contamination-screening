@@ -1,4 +1,4 @@
-# Food Contamination Screening System
+# Inline Microbial Contamination Detection
 
 An inline optical screening prototype for food items on a conveyor. Each item is inspected with two complementary optical channels, **visible RGB reflectance** and **UV-induced fluorescence**, and a **Teensy 4.1** handles acquisition, classification, conveyor control and sorting.
 
