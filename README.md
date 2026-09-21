@@ -333,19 +333,9 @@ food-contamination-screening/
 - [OMLC PhotochemCAD, riboflavin spectra](https://omlc.org/spectra/PhotochemCAD/html/004.html)
 - [SPIE: Ocular UV protection, revisiting safe limits](https://proceedings.spiedigitallibrary.org/conference-proceedings-of-spie/8567/85671K/Ocular-UV-protection--revisiting-safe-limits-for-sunglasses-standards/10.1117/12.2000355.full)
 
-> Datasheets and papers belong to their publishers. They are linked here, not redistributed.
 
----
 
-## Team
 
-| Name | Role | GitHub |
-|---|---|---|
-| Your Name | Firmware / lead | [@YOUR-USERNAME](https://github.com/YOUR-USERNAME) |
-| Teammate | Hardware / optics | [@teammate](https://github.com/teammate) |
-| Teammate | Testing / data | [@teammate](https://github.com/teammate) |
-
----
 
 ## License
 
