@@ -1,8 +1,8 @@
 # Inline Microbial Contamination Detection
 
-An inline optical screening prototype for food items on a conveyor. Each item is inspected with two complementary optical channels, **visible RGB reflectance** and **UV-induced fluorescence**, and a **Teensy 4.1** handles acquisition, classification, conveyor control and sorting.
+An inline optical screening prototype for food items on a conveyor. Each item is inspected with two complementary optical channels, **visible RGB reflectance** and **UV-induced fluorescence**, plus a **webcam feed analyzed on a Jetson Nano** for vegetable identification. A **Teensy 4.1** handles acquisition, classification, conveyor control and sorting, and coordinates with the Jetson over USB serial.
 
-> **Validation boundary:** This is an engineering screening prototype. It is **not** a validated food-safety detector. The current UV threshold in firmware is a **development placeholder** and must not be treated as a contamination limit. Any detection claim requires target-specific calibration and validation against an appropriate reference method.
+> **Validation boundary:** This is an engineering screening prototype. It is **not** a validated food-safety detector. The current UV threshold in firmware is a **development placeholder** and must not be treated as a contamination limit. The object detection model identifies vegetable type; it does not detect contamination itself. Any detection claim requires target-specific calibration and validation against an appropriate reference method.
 
 ---
 
@@ -13,18 +13,19 @@ An inline optical screening prototype for food items on a conveyor. Each item is
 3. [Pin map](#pin-map)
 4. [Firmware state machine](#firmware-state-machine)
 5. [Signal processing and decision logic](#signal-processing-and-decision-logic)
-6. [Calibration and riboflavin reference](#calibration-and-riboflavin-reference)
-7. [Data logging](#data-logging)
-8. [Fault handling](#fault-handling)
-9. [UV safety](#uv-safety)
-10. [Testing and validation plan](#testing-and-validation-plan)
-11. [Roadmap](#roadmap)
-12. [Known issues and things to verify](#known-issues-and-things-to-verify)
-13. [Repository structure](#repository-structure)
-14. [Getting started](#getting-started)
-15. [References](#references)
-16. [Team](#team)
-17. [License](#license)
+6. [Jetson Nano vegetable detection](#jetson-nano-vegetable-detection)
+7. [Teensy <-> Jetson serial protocol](#teensy---jetson-serial-protocol)
+8. [Calibration and riboflavin reference](#calibration-and-riboflavin-reference)
+9. [Data logging](#data-logging)
+10. [Fault handling](#fault-handling)
+11. [UV safety](#uv-safety)
+12. [Testing and validation plan](#testing-and-validation-plan)
+13. [Roadmap](#roadmap)
+14. [Known issues and things to verify](#known-issues-and-things-to-verify)
+15. [Repository structure](#repository-structure)
+16. [Getting started](#getting-started)
+17. [References](#references)
+18. [License](#license)
 
 ---
 
@@ -43,20 +44,26 @@ Operating sequence:
 3. The controller waits for a stable measurement window.
 4. **TCS34725** captures visible RGB + clear data with illumination ON and OFF.
 5. The **UV ring + BPW34** photodiode capture fluorescence with UV ON and OFF.
-6. Background is subtracted and readings are filtered.
-7. Features are computed and the decision engine outputs **PASS**, **FLAGGED** or **UNCERTAIN**.
-8. The conveyor and **servo gate** route the item.
-9. Raw values, corrected values, timing and the decision are logged.
+6. The **Jetson Nano** captures webcam frames and runs object detection to identify the vegetable type and confidence.
+7. Background is subtracted and readings are filtered.
+8. Optical features are computed and the decision engine outputs **PASS**, **FLAGGED** or **UNCERTAIN**.
+9. The Jetson's vegetable identification result is combined with the optical decision.
+10. The conveyor and **servo gate** route the item.
+11. Raw values, corrected values, the vegetable identification result, timing and the decision are logged.
 
-Correction rule used for each channel:
+Correction rule used for each optical channel:
 
 ```
 corrected = MAX(0, measurement_with_illumination - measurement_without_illumination)
 ```
 
-### Why two channels?
+### Why two optical channels?
 
 Published USDA work on fecal contamination of apples found that reflectance imaging alone was inadequate for thin smears, while UV fluorescence detected them, and that two-band ratios improved sensitivity. Combining reflectance and fluorescence gives more features than a single UV threshold. It still does not prove the presence or absence of a specific contaminant. See [References](#references).
+
+### Why add a webcam and object detection?
+
+The optical channels detect abnormal *signatures*, but they don't identify *what* the item is. Adding a webcam and an object detection model on the Jetson Nano lets the system recognize the vegetable type, which supports per-vegetable calibration and logging (different produce can have different normal fluorescence/reflectance ranges).
 
 ---
 
@@ -65,6 +72,8 @@ Published USDA work on fecal contamination of apples found that reflectance imag
 | Function | Component |
 |---|---|
 | Controller | Teensy 4.1 (600 MHz Cortex-M7, 3.3 V logic) |
+| Vision co-processor | Jetson Nano (runs object detection, connected to Teensy over USB serial) |
+| Camera | USB webcam (`/dev/video0`) |
 | Visible reflectance | TCS34725 RGB + clear sensor with white LED |
 | UV excitation | UV LED ring, about 390-395 nm, switched by relay |
 | Fluorescence detection | BPW34 photodiode with optical filter and analog front-end |
@@ -95,6 +104,7 @@ Treat this table as the firmware interface definition. Keep all pin numbers in a
 | Manual button | 10 | Digital in | INPUT_PULLUP |
 | Status LED | 13 | Digital out | Built-in Teensy LED |
 | BPW34 analog | 14 (A0) | ADC | UV fluorescence channel |
+| Jetson Nano | USB | Serial (115200 baud) | Auto-detected on `/dev/ttyACM*` or `/dev/ttyUSB*` from the Jetson side |
 
 ### Electrical notes
 
@@ -103,6 +113,7 @@ Treat this table as the firmware interface definition. Keep all pin numbers in a
 - Route motor and relay wiring away from the photodiode front-end. Decouple supplies to limit switching noise on the analog channel.
 - Keep the BPW34 amplifier output within the Teensy ADC input range.
 - Wire the UV ring through the relay **COM and NO** contacts so UV is OFF when the controller is unpowered. Confirm behavior on the physical relay module.
+- The Jetson Nano and Teensy share only a USB serial connection; power each from its own supply rather than relying on USB bus power for both.
 
 ---
 
@@ -115,7 +126,7 @@ A deterministic state machine prevents motor, UV, servo and sensor activity from
 | `BOOT` | Initialize hardware | Safe GPIO states, I2C, TCS34725, OLED, servo, motor driver |
 | `CALIBRATE` | Establish baseline | Dark readings, sensor sanity checks, optional startup calibration |
 | `IDLE` | Wait for item | Conveyor ready, illumination off, monitor IR |
-| `SCANNING` | Acquire data | Visible scan, UV scan, timing and averaging |
+| `SCANNING` | Acquire data | Visible scan, UV scan, timing and averaging, request Jetson scan |
 | `CLASSIFY` | Compute result | Background correction, feature extraction, decision |
 | `ACT` | Physical response | Conveyor motion and/or servo gate |
 | `LOG` | Record result | Serial, OLED, CSV |
@@ -124,7 +135,7 @@ A deterministic state machine prevents motor, UV, servo and sensor activity from
 Normal cycle:
 
 ```
-IDLE → IR TRIGGER → SCANNING → CLASSIFY → ACT → LOG → IDLE
+IDLE → IR TRIGGER → SCANNING (optical + Jetson vegetable ID) → CLASSIFY → ACT → LOG → IDLE
 ```
 
 ---
@@ -150,6 +161,7 @@ IDLE → IR TRIGGER → SCANNING → CLASSIFY → ACT → LOG → IDLE
 |---|---|
 | Raw | R, G, B, C, UV (corrected), noise, timing |
 | Derived | R/G, G/B, R/B, UV/C, UV relative to local background |
+| Vision | Vegetable name, detection confidence (from Jetson) |
 
 Ratios can reduce sensitivity to absolute intensity but amplify noise when the denominator is small, so each feature should be evaluated statistically on real calibration data.
 
@@ -166,6 +178,65 @@ Decision boundaries should come from measured distributions and the relative cos
 
 ---
 
+## Jetson Nano vegetable detection
+
+The Jetson Nano runs a **YOLOv4-Tiny object detection model** (via OpenCV's DNN module) against webcam frames to identify the vegetable type on the conveyor. This is a computer-vision object detector, not a language model: it takes an image and outputs bounding boxes, class names and confidence scores, it does not process text.
+
+- **Model:** YOLOv4-Tiny, loaded from local `.cfg` and `.weights` files, with class names from a `coco.names`-style file.
+- **Acceleration:** attempts CUDA (FP16) on the Jetson's GPU, falls back to CPU automatically if unavailable.
+- **Input:** USB webcam at 640x480, resized to 416x416 for the network.
+- **Filtering:** detections are filtered against a fixed `VEGETABLE_CLASSES` set so only produce-relevant results are reported (other COCO classes are ignored).
+- **Per-scan logic:** captures a few frames per scan cycle, keeps the frame with the highest-confidence vegetable detection, and saves that frame to disk for later review.
+- **Output:** the vegetable name and confidence percentage are sent to the Teensy over serial.
+
+Required local files on the Jetson (paths from `~/food_scanner/`):
+
+```
+models/yolov4-tiny.cfg
+models/yolov4-tiny.weights
+models/coco.names
+```
+
+Captured images are saved to `~/food_scanner/captures/`.
+
+> **Note:** the object detection model identifies vegetable *type*. It does not itself detect contamination, that remains the job of the optical channels. Detection accuracy also depends on lighting, camera angle and how well the model's training data matches the actual produce, so this should be validated the same way as the optical thresholds, not assumed to be reliable out of the box.
+
+---
+
+## Teensy <-> Jetson serial protocol
+
+Communication runs over USB serial at **115200 baud**, newline-terminated ASCII messages.
+
+**Teensy → Jetson**
+
+| Message | Meaning |
+|---|---|
+| `SYSTEM_READY` | Teensy has booted and is ready |
+| `OBJECT_DETECTED` | IR sensor has detected an item |
+| `SCAN_START` | Teensy is ready for the Jetson to run its camera scan |
+| `SCAN_DONE` | Teensy has finished its own optical scan |
+
+**Jetson → Teensy**
+
+| Message | Meaning |
+|---|---|
+| `START_SCAN` | Acknowledges `OBJECT_DETECTED`; tells Teensy the Jetson is starting |
+| `RESULT:VEGETABLE:<name>:<confidence>` | A vegetable was identified, e.g. `RESULT:VEGETABLE:tomato:87` |
+| `RESULT:NON_VEGETABLE` | No recognized vegetable was found in the scan window |
+
+Typical exchange:
+
+```
+Teensy:  OBJECT_DETECTED
+Jetson:  START_SCAN
+Teensy:  SCAN_START
+   ...Jetson runs camera scan...
+Teensy:  SCAN_DONE
+Jetson:  RESULT:VEGETABLE:carrot:92
+```
+
+---
+
 ## Calibration and riboflavin reference
 
 Calibrate with the same optics, sample-to-sensor distance, conveyor speed, exposure timing and illumination used in routine operation.
@@ -175,6 +246,7 @@ Calibrate with the same optics, sample-to-sensor distance, conveyor speed, expos
 - Repeat across separate runs and days.
 - Record mean, standard deviation, range and any sub-populations.
 - Repeat at different item positions within the allowed mechanical tolerance.
+- Where practical, calibrate separately per vegetable type once the Jetson can identify it, since baseline optical response may differ by produce.
 
 **Reference-positive data**
 - Should represent the specific target the system is meant to screen for.
@@ -200,7 +272,9 @@ Serial/CSV record:
 timestamp, item_id, r_light, g_light, b_light, c_light,
 r_dark, g_dark, b_dark, c_dark,
 r_corr, g_corr, b_corr, c_corr,
-uv_light, uv_dark, uv_corr, noise, result, cycle_ms
+uv_light, uv_dark, uv_corr, noise,
+vegetable_name, vegetable_confidence,
+result, cycle_ms
 ```
 
 Keep measurement data separate from the decision label so the raw dataset is not contaminated by a premature classification.
@@ -211,6 +285,7 @@ Keep measurement data separate from the decision label so the raw dataset is not
 | Environment | ambient condition notes, setup identifier |
 | Visible raw / corrected | r_light ... c_dark, r_corr ... c_corr |
 | UV raw / corrected | uv_light, uv_dark, uv_corr |
+| Vision | vegetable_name, vegetable_confidence, captured_image_path |
 | Quality | noise, saturation_flag, sensor_valid |
 | Decision | result, confidence/score if available |
 | Actuation | gate_angle, conveyor_time, action_status |
@@ -230,6 +305,9 @@ Optional OLED screens: READY, SCANNING, RESULT, FAULT, CALIBRATION. The system m
 | BPW34 saturation/noise | ADC near rail or variance too high | Mark measurement invalid / UNCERTAIN |
 | Servo fault | Position/timeout issue if feedback exists | Stop conveyor or use maintenance-safe state |
 | Motor driver fault | No expected motion / external monitoring | Stop system; report operator fault |
+| Jetson serial port not found | No `/dev/ttyACM*` or `/dev/ttyUSB*` device | Jetson script raises an error at startup; check USB connection |
+| Camera fails to open | `cv2.VideoCapture` returns not opened | Jetson script raises an error at startup; check webcam connection/index |
+| No Teensy response after `OBJECT_DETECTED` | Jetson never receives further Teensy messages | Treat as a Teensy-side fault; Jetson loop will simply keep waiting |
 
 ---
 
@@ -254,11 +332,12 @@ Optional OLED screens: READY, SCANNING, RESULT, FAULT, CALIBRATION. The system m
 | D | Dark stability | Background stays within an established noise envelope |
 | E | Repeatability | Same reference measured repeatedly with bounded variation |
 | F | Geometry test | Small position changes do not destroy class separation |
-| G | Timing test | Measurement + actuation fits the conveyor timing budget |
+| G | Timing test | Measurement + actuation fits the conveyor timing budget, including Jetson scan time |
 | H | System test | PASS / FLAGGED / UNCERTAIN trigger correct physical actions |
-| I | Target-specific validation | Performance evaluated against appropriate reference/lab results |
+| I | Vegetable detection test | Object detection identifies known vegetables at acceptable accuracy under station lighting |
+| J | Target-specific validation | Performance evaluated against appropriate reference/lab results |
 
-Metrics to capture: mean and standard deviation per feature, false-positive and false-negative counts, repeatability across runs and days, cycle time and sorting latency, percentage of UNCERTAIN results, and sensor dropout and fault rates.
+Metrics to capture: mean and standard deviation per optical feature, false-positive and false-negative counts, repeatability across runs and days, cycle time and sorting latency (including Jetson scan time), percentage of UNCERTAIN results, sensor dropout and fault rates, and vegetable detection accuracy/confidence distribution per class.
 
 ---
 
@@ -269,11 +348,12 @@ Metrics to capture: mean and standard deviation per feature, false-positive and 
 | 1 | Hardware bring-up | Stable TCS34725, BPW34, UV relay/ring, IR, servo, conveyor |
 | 2 | Optical repeatability | Stable geometry, dark subtraction, noise characterization |
 | 3 | Reference testing | Clean baseline + fluorescent reference checks |
-| 4 | Target-specific dataset | Known/reference samples with external ground truth |
-| 5 | Decision model | Thresholds or statistical classifier validated on held-out data |
-| 6 | Inline automation | Reliable conveyor timing and gate operation |
-| 7 | Enclosure and safety | Light control, UV containment, wiring, maintenance design |
-| 8 | Production-oriented validation | Long-run testing, drift monitoring, service procedures |
+| 4 | Vision integration | Webcam + Jetson Nano object detection, Teensy-Jetson serial protocol |
+| 5 | Target-specific dataset | Known/reference samples with external ground truth, per-vegetable if useful |
+| 6 | Decision model | Thresholds or statistical classifier validated on held-out data |
+| 7 | Inline automation | Reliable conveyor timing and gate operation |
+| 8 | Enclosure and safety | Light control, UV containment, wiring, maintenance design |
+| 9 | Production-oriented validation | Long-run testing, drift monitoring, service procedures |
 
 ---
 
@@ -284,6 +364,8 @@ Metrics to capture: mean and standard deviation per feature, false-positive and 
 - [ ] **Filter vs. reference:** riboflavin emits green light (peak near 530 nm). If the BPW34 uses a red filter, check its transmission curve before using riboflavin to validate the optical path.
 - [ ] **UV threshold** is a placeholder and needs calibration data.
 - [ ] **TCS34725 availability:** sources disagree on the part's lifecycle status. Verify before ordering more.
+- [ ] **Vegetable detection accuracy** has not yet been benchmarked under actual station lighting/geometry. Run Phase I of the test plan before relying on it.
+- [ ] **Teensy firmware source file** for the actual detection/control logic (the `.ino` sketch) should be kept in `firmware/`, separate from the Jetson's Python code, to avoid confusion between the two.
 
 ---
 
@@ -292,15 +374,20 @@ Metrics to capture: mean and standard deviation per feature, false-positive and 
 ```
 food-contamination-screening/
 ├── README.md
+├── LICENSE
+├── .gitignore
 ├── docs/          Architecture PDF, references
-├── firmware/      Teensy 4.1 code
+├── firmware/      Teensy 4.1 code (.ino)
+├── jetson/        Jetson Nano vegetable detection script (.py), model files
 ├── hardware/      Wiring diagrams, pin map, BOM
-└── data/          Calibration and test CSV logs
+└── data/          Calibration and test CSV logs, captured images
 ```
 
 ---
 
 ## Getting started
+
+### Teensy side
 
 1. Install the [Arduino IDE](https://www.arduino.cc/en/software) and the **Teensyduino** add-on.
 2. Clone the repo:
@@ -309,7 +396,30 @@ food-contamination-screening/
    ```
 3. Open the sketch in `firmware/`, select **Teensy 4.1** as the board, and edit the pin configuration section if your wiring differs.
 4. Wire the hardware following the [pin map](#pin-map). Bring up subsystems one at a time (Stage 1).
-5. Open the Serial Monitor to view CSV output and run the calibration phases in the [testing plan](#testing-and-validation-plan).
+
+### Jetson Nano side
+
+1. Install dependencies:
+   ```
+   pip3 install opencv-python pyserial
+   ```
+   (On Jetson, OpenCV with CUDA support is usually provided by the JetPack image rather than pip.)
+2. Place the model files under `~/food_scanner/models/`:
+   ```
+   yolov4-tiny.cfg
+   yolov4-tiny.weights
+   coco.names
+   ```
+3. Connect the USB webcam and the Teensy over USB.
+4. Run the script from `jetson/`:
+   ```
+   python3 vegetable_detector.py
+   ```
+5. Confirm it prints `JETSON READY` and connects to the correct serial port.
+
+### Full system
+
+Open the Serial Monitor on the Teensy side to view CSV output, and run the calibration phases in the [testing plan](#testing-and-validation-plan).
 
 ---
 
@@ -328,6 +438,10 @@ food-contamination-screening/
 - [PJRC Teensy 4.1](https://www.pjrc.com/store/teensy41.html)
 - [Pololu TB6612FNG](https://www.pololu.com/product/713)
 
+**Object detection**
+- [YOLOv4-Tiny (AlexeyAB/darknet)](https://github.com/AlexeyAB/darknet)
+- [OpenCV DNN module documentation](https://docs.opencv.org/4.x/d2/d58/tutorial_table_of_content_dnn.html)
+
 **Reference material and safety**
 - [USP Riboflavin monograph](https://www.drugfuture.com/Pharmacopoeia/USP35/data/v35300/usp35nf30s0_m73500.html)
 - [OMLC PhotochemCAD, riboflavin spectra](https://omlc.org/spectra/PhotochemCAD/html/004.html)
@@ -335,8 +449,6 @@ food-contamination-screening/
 
 
 
-
-
 ## License
 
-Add your chosen license here (for example, MIT) and include a `LICENSE` file in the repo root.
+MIT License. See `LICENSE`.
